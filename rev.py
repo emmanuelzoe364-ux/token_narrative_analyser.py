@@ -18,6 +18,25 @@ st.set_page_config(
 st.title("Token Narrative Analyzer")
 st.caption("Paste a contract address → get official narrative + ONS score")
 
+
+# -------------------------
+# Small formatting helpers
+# -------------------------
+
+def to_float(x) -> Optional[float]:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_usd(x, decimals: int = 0) -> str:
+    v = to_float(x)
+    if v is None:
+        return "N/A"
+    return f"${v:,.{decimals}f}"
+
+
 # -------------------------
 # Helpers: chain detection
 # -------------------------
@@ -109,15 +128,13 @@ def fetch_website_text(url: str) -> Optional[str]:
 # -------------------------
 
 def split_into_sentences(text: str) -> List[str]:
-    # Regex: split on whitespace that follows . ! or ?
-    parts = re.split(r"(?<=[.!?])s+", text.replace("
-", " "))
+    # Split on whitespace that follows . ! or ?
+    parts = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
     return [p.strip() for p in parts if p.strip()]
 
 
 def extract_summary_sentences(text: str, keywords: List[str]) -> str:
-    text = text.replace("
-", " ")
+    text = text.replace("\n", " ")
     sentences = split_into_sentences(text)
     scored = []
     kw_lower = [k.lower() for k in keywords]
@@ -221,7 +238,7 @@ def extract_website_narrative_items(text: str) -> List[Dict[str, Any]]:
 def extract_twitter_handle(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
-    m = re.search(r"(?:x.com|twitter.com)/([A-Za-z0-9_]+)", url)
+    m = re.search(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)", url)
     return m.group(1) if m else None
 
 
@@ -242,8 +259,11 @@ def fetch_x_profile(handle: str) -> Optional[Dict[str, Any]]:
         joined_match = re.search(r'<meta name="twitter:data2" content="([^"]+)"', html)
         joined = joined_match.group(1) if joined_match else None
 
+        posts = None
         posts_match = re.search(r'<meta name="twitter:data1" content="([^"]+)"', html)
-        posts = int(posts_match.group(1)) if posts_match else None
+        if posts_match:
+            digits = re.sub(r"[^\d]", "", posts_match.group(1))
+            posts = int(digits) if digits else None
 
         return {
             "bio": bio,
@@ -387,17 +407,13 @@ if st.button("Analyze token"):
             st.subheader(f"{token['name']} ({token['symbol']})")
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                price_str = f"${token['price_usd']:.8f}" if token["price_usd"] else "N/A"
-                st.metric("Price (USD)", price_str)
+                st.metric("Price (USD)", fmt_usd(token["price_usd"], 8))
             with c2:
-                liq_str = f"${token['liquidity_usd']:,.0f}" if token["liquidity_usd"] else "N/A"
-                st.metric("Liquidity (USD)", liq_str)
+                st.metric("Liquidity (USD)", fmt_usd(token["liquidity_usd"]))
             with c3:
-                vol_str = f"${token['volume_24h_usd']:,.0f}" if token["volume_24h_usd"] else "N/A"
-                st.metric("24h Volume (USD)", vol_str)
+                st.metric("24h Volume (USD)", fmt_usd(token["volume_24h_usd"]))
             with c4:
-                mcap_str = f"${token['market_cap_usd']:,.0f}" if token["market_cap_usd"] else "N/A"
-                st.metric("Market Cap (USD)", mcap_str)
+                st.metric("Market Cap (USD)", fmt_usd(token["market_cap_usd"]))
 
             st.caption(
                 f"Chain: {token['chain']} | Detected: {result['chain_detected']} | "
