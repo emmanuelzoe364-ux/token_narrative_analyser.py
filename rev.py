@@ -1,9 +1,14 @@
 import re
 import json
+import time
 import requests
 from typing import Optional, Dict, Any, List
 
 import streamlit as st
+
+# NOTE: this file deliberately contains no backslash characters.
+# Earlier copies broke because copy/paste turned newline escapes into real line breaks
+# and dropped the backslash from whitespace and digit patterns.
 
 # -------------------------
 # Page config
@@ -16,7 +21,7 @@ st.set_page_config(
 )
 
 st.title("Token Narrative Analyzer")
-st.caption("Paste a contract address → get official narrative + ONS score")
+st.caption("Paste a contract address → get official narrative + ONS score + on-chain metrics")
 
 
 # -------------------------
@@ -37,6 +42,13 @@ def fmt_usd(x, decimals: int = 0) -> str:
     return f"${v:,.{decimals}f}"
 
 
+def fmt_ratio(x, decimals: int = 2) -> str:
+    v = to_float(x)
+    if v is None:
+        return "N/A"
+    return f"{v:.{decimals}f}x"
+
+
 # -------------------------
 # Helpers: chain detection
 # -------------------------
@@ -44,7 +56,7 @@ def fmt_usd(x, decimals: int = 0) -> str:
 def detect_chain(contract: str) -> str:
     c = contract.strip()
     if not c.startswith("0x") and 30 <= len(c) <= 48:
-        if re.match(r"^[1-9A-HJ-NP-Za-km-z]+$", c):
+        if re.match("^[1-9A-HJ-NP-Za-km-z]+$", c):
             return "solana"
     if c.startswith("0x") and len(c) == 42:
         return "evm"
@@ -83,21 +95,65 @@ def fetch_token_from_dexscreener(contract: str) -> Optional[Dict[str, Any]]:
             if t == "telegram":
                 telegram = u
 
+        # Age (of the highest-liquidity pair)
+        created_ms = pair.get("pairCreatedAt")
+        age_days = None
+        age_months = None
+        if created_ms and isinstance(created_ms, (int, float)) and created_ms > 0:
+            now_ms = time.time() * 1000
+            age_days = (now_ms - created_ms) / 86400000.0
+            age_months = age_days / 30.44
+
+        # Volume / liquidity / market cap
+        liq_usd = (pair.get("liquidity") or {}).get("usd") or 0.0
+        vol_h24 = (pair.get("volume") or {}).get("h24") or 0.0
+        mcap = pair.get("marketCap") or 0.0
+        fdv = pair.get("fdv") or 0.0
+
+        vol_liq_24h = (vol_h24 / liq_usd) if liq_usd > 0 else None
+
+        # Proxies for 7d and 30d using 24h volume as a rough base
+        vol_7d_proxy = vol_h24 * 7
+        vol_30d_proxy = vol_h24 * 30
+        vol_liq_7d_proxy = (vol_7d_proxy / liq_usd) if liq_usd > 0 else None
+        vol_liq_30d_proxy = (vol_30d_proxy / liq_usd) if liq_usd > 0 else None
+
+        # FDV / liquidity
+        fdv_liq_ratio = (fdv / liq_usd) if liq_usd > 0 else None
+        mcap_fdv_ratio = (mcap / fdv) if fdv > 0 else None
+
+        # Volume / market cap and liquidity / market cap
+        vol_mcap_24h = (vol_h24 / mcap) if mcap > 0 else None
+        liq_mcap_ratio = (liq_usd / mcap) if mcap > 0 else None
+
         return {
             "symbol": base.get("symbol"),
             "name": base.get("name"),
             "address": base.get("address"),
             "chain": pair.get("chainId"),
             "price_usd": pair.get("priceUsd"),
-            "liquidity_usd": (pair.get("liquidity") or {}).get("usd"),
-            "volume_24h_usd": (pair.get("volume") or {}).get("h24"),
-            "market_cap_usd": pair.get("marketCap"),
-            "fdv_usd": pair.get("fdv"),
-            "pair_created_ts": pair.get("pairCreatedAt"),
+            "liquidity_usd": liq_usd,
+            "volume_24h_usd": vol_h24,
+            "market_cap_usd": mcap,
+            "fdv_usd": fdv,
+            "pair_created_ts": created_ms,
             "website": website,
             "twitter": twitter,
             "telegram": telegram,
             "dex_url": pair.get("url"),
+            # Age
+            "age_days": age_days,
+            "age_months": age_months,
+            # Vol/Liq
+            "vol_liq_24h": vol_liq_24h,
+            "vol_liq_7d_proxy": vol_liq_7d_proxy,
+            "vol_liq_30d_proxy": vol_liq_30d_proxy,
+            # FDV ratios
+            "fdv_liq_ratio": fdv_liq_ratio,
+            "mcap_fdv_ratio": mcap_fdv_ratio,
+            # Vol/Mcap & Liq/Mcap
+            "vol_mcap_24h": vol_mcap_24h,
+            "liq_mcap_ratio": liq_mcap_ratio,
         }
     except Exception as e:
         st.error(f"DexScreener error: {e}")
@@ -127,14 +183,19 @@ def fetch_website_text(url: str) -> Optional[str]:
 # Sentence splitting and extraction
 # -------------------------
 
+def flatten(text: str) -> str:
+    # Turn all line breaks into single spaces (no backslashes needed)
+    return " ".join(text.splitlines())
+
+
 def split_into_sentences(text: str) -> List[str]:
-    # Split on whitespace that follows . ! or ?
-    parts = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+    # Split on spaces that follow . ! or ?
+    parts = re.split("(?<=[.!?]) +", flatten(text))
     return [p.strip() for p in parts if p.strip()]
 
 
 def extract_summary_sentences(text: str, keywords: List[str]) -> str:
-    text = text.replace("\n", " ")
+    text = flatten(text)
     sentences = split_into_sentences(text)
     scored = []
     kw_lower = [k.lower() for k in keywords]
@@ -238,7 +299,7 @@ def extract_website_narrative_items(text: str) -> List[Dict[str, Any]]:
 def extract_twitter_handle(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
-    m = re.search(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)", url)
+    m = re.search("(?:x[.]com|twitter[.]com)/([A-Za-z0-9_]+)", url)
     return m.group(1) if m else None
 
 
@@ -253,16 +314,16 @@ def fetch_x_profile(handle: str) -> Optional[Dict[str, Any]]:
         r.raise_for_status()
         html = r.text
 
-        bio_match = re.search(r'<meta name="twitter:description" content="([^"]+)"', html)
+        bio_match = re.search('<meta name="twitter:description" content="([^"]+)"', html)
         bio = bio_match.group(1) if bio_match else None
 
-        joined_match = re.search(r'<meta name="twitter:data2" content="([^"]+)"', html)
+        joined_match = re.search('<meta name="twitter:data2" content="([^"]+)"', html)
         joined = joined_match.group(1) if joined_match else None
 
         posts = None
-        posts_match = re.search(r'<meta name="twitter:data1" content="([^"]+)"', html)
+        posts_match = re.search('<meta name="twitter:data1" content="([^"]+)"', html)
         if posts_match:
-            digits = re.sub(r"[^\d]", "", posts_match.group(1))
+            digits = re.sub("[^0-9]", "", posts_match.group(1))
             posts = int(digits) if digits else None
 
         return {
@@ -415,9 +476,49 @@ if st.button("Analyze token"):
             with c4:
                 st.metric("Market Cap (USD)", fmt_usd(token["market_cap_usd"]))
 
+            # Age & vol/liq
+            c5, c6, c7, c8 = st.columns(4)
+            with c5:
+                age_m_str = f"{token['age_months']:.1f} months" if token["age_months"] else "N/A"
+                st.metric("Age", age_m_str)
+            with c6:
+                st.metric("Vol/Liq (24h)", fmt_ratio(token["vol_liq_24h"]))
+            with c7:
+                st.metric("Vol/Liq (7d proxy)", fmt_ratio(token["vol_liq_7d_proxy"]))
+            with c8:
+                st.metric("Vol/Liq (30d proxy)", fmt_ratio(token["vol_liq_30d_proxy"]))
+
+            # FDV & ratios
+            c9, c10, c11, c12 = st.columns(4)
+            with c9:
+                st.metric("FDV (USD)", fmt_usd(token["fdv_usd"]))
+            with c10:
+                st.metric("FDV / Liq", fmt_ratio(token["fdv_liq_ratio"]))
+            with c11:
+                st.metric("MCap / FDV", fmt_ratio(token["mcap_fdv_ratio"]))
+            with c12:
+                st.metric("6m Avg Vol/Liq", "N/A (needs history)")
+
+            # Vol/Mcap & Liq/Mcap
+            c13, c14, c15, c16 = st.columns(4)
+            with c13:
+                st.metric("Vol / MCap (24h)", fmt_ratio(token["vol_mcap_24h"]))
+            with c14:
+                st.metric("Liq / MCap", fmt_ratio(token["liq_mcap_ratio"]))
+            with c15:
+                # Reserved for future metrics
+                st.metric("Holder Count", "N/A")
+            with c16:
+                st.metric("Top 10 Holders %", "N/A")
+
             st.caption(
                 f"Chain: {token['chain']} | Detected: {result['chain_detected']} | "
                 f"DexScreener: [link]({token['dex_url']})"
+            )
+
+            st.caption(
+                "Vol/Liq 7d/30d are rough proxies based on 24h volume. "
+                "True 6m averages and holder metrics require historical/on-chain data."
             )
 
             st.subheader("Official Narrative Score (ONS)")
