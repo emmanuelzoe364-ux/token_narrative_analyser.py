@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import time
@@ -25,7 +26,7 @@ st.caption("Paste a contract address → get official narrative + ONS score + on
 
 
 # -------------------------
-# Small formatting helpers
+# Small formatting / math helpers
 # -------------------------
 
 def to_float(x) -> Optional[float]:
@@ -49,6 +50,33 @@ def fmt_ratio(x, decimals: int = 2) -> str:
     return f"{v:.{decimals}f}x"
 
 
+def fmt_pct(x, decimals: int = 0) -> str:
+    v = to_float(x)
+    if v is None:
+        return "N/A"
+    return f"{v * 100:.{decimals}f}%"
+
+
+def num(x) -> float:
+    v = to_float(x)
+    return v if v is not None else 0.0
+
+
+def safe_div(a, b) -> Optional[float]:
+    a = to_float(a)
+    b = to_float(b)
+    if a is None or b is None or b <= 0:
+        return None
+    return a / b
+
+
+def positive_or_none(x) -> Optional[float]:
+    v = to_float(x)
+    if v is None or v <= 0:
+        return None
+    return v
+
+
 # -------------------------
 # Helpers: chain detection
 # -------------------------
@@ -64,100 +92,257 @@ def detect_chain(contract: str) -> str:
 
 
 # -------------------------
-# DexScreener fetch
+# DexScreener: fetch ALL pools for the token, then aggregate
 # -------------------------
 
-def fetch_token_from_dexscreener(contract: str) -> Optional[Dict[str, Any]]:
-    url = "https://api.dexscreener.com/latest/dex/search/"
-    params = {"q": contract}
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        pairs = data.get("pairs") or []
-        if not pairs:
-            return None
+DEX_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
+DEX_PAIR_CAP = 30  # DexScreener returns at most ~30 pairs per token lookup
 
-        pair = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
-        base = pair.get("baseToken") or {}
-        info = pair.get("info") or {}
+
+def pair_liq(p: Dict[str, Any]) -> float:
+    return num((p.get("liquidity") or {}).get("usd"))
+
+
+def pair_vol(p: Dict[str, Any], window: str) -> float:
+    return num((p.get("volume") or {}).get(window))
+
+
+def same_address(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return False
+    a = a.strip()
+    b = b.strip()
+    if a.startswith("0x") or b.startswith("0x"):
+        return a.lower() == b.lower()
+    return a == b
+
+
+def fetch_pairs(contract: str) -> List[Dict[str, Any]]:
+    r = requests.get(DEX_TOKENS_URL + contract.strip(), timeout=20)
+    r.raise_for_status()
+    pairs = r.json().get("pairs") or []
+    seen = set()
+    unique = []
+    for p in pairs:
+        key = (p.get("chainId"), p.get("pairAddress"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique
+
+
+def aggregate_token(contract: str, pairs: List[Dict[str, Any]], chain_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not pairs:
+        return None
+
+    # Optional filter by the chain family the user selected
+    if chain_hint == "solana":
+        filtered = [p for p in pairs if p.get("chainId") == "solana"]
+    elif chain_hint == "evm":
+        filtered = [p for p in pairs if p.get("chainId") != "solana"]
+    else:
+        filtered = pairs
+    if filtered:
+        pairs = filtered
+
+    # Only count pools where this token is the base token (price/mcap/fdv refer to the base token)
+    token_pairs = [p for p in pairs if same_address((p.get("baseToken") or {}).get("address"), contract)]
+    quote_only = False
+    if not token_pairs:
+        token_pairs = [p for p in pairs if same_address((p.get("quoteToken") or {}).get("address"), contract)]
+        quote_only = bool(token_pairs)
+    if not token_pairs:
+        token_pairs = pairs
+
+    # The same address can exist on several chains: keep the chain with the deepest liquidity
+    by_chain: Dict[str, List[Dict[str, Any]]] = {}
+    for p in token_pairs:
+        by_chain.setdefault(p.get("chainId") or "unknown", []).append(p)
+    chain_id = max(by_chain, key=lambda c: sum(pair_liq(p) for p in by_chain[c]))
+    ps = sorted(by_chain[chain_id], key=pair_liq, reverse=True)
+    best = ps[0]
+
+    tok = (best.get("quoteToken") if quote_only else best.get("baseToken")) or {}
+
+    # Aggregates across all pools
+    liq_total = sum(pair_liq(p) for p in ps)
+    vol_h1 = sum(pair_vol(p, "h1") for p in ps)
+    vol_h6 = sum(pair_vol(p, "h6") for p in ps)
+    vol_h24 = sum(pair_vol(p, "h24") for p in ps)
+
+    buys_24 = 0
+    sells_24 = 0
+    for p in ps:
+        h24 = (p.get("txns") or {}).get("h24") or {}
+        buys_24 += int(num(h24.get("buys")))
+        sells_24 += int(num(h24.get("sells")))
+
+    # Market cap / FDV are token-level; take the deepest pool's value, else any pool that has one
+    mcap = None
+    fdv = None
+    for p in ps:
+        if mcap is None:
+            mcap = positive_or_none(p.get("marketCap"))
+        if fdv is None:
+            fdv = positive_or_none(p.get("fdv"))
+    if quote_only:
+        mcap = None
+        fdv = None
+
+    # Website / socials can be attached to only some pools
+    website = None
+    twitter = None
+    telegram = None
+    for p in ps:
+        info = p.get("info") or {}
         websites = info.get("websites") or []
         socials = info.get("socials") or []
-
-        website = websites[0]["url"] if websites else None
-        twitter = None
-        telegram = None
+        if website is None and websites:
+            website = websites[0].get("url")
         for s in socials:
-            t = s.get("type", "").lower()
-            u = s.get("url", "")
-            if t == "twitter" or "x.com" in u or "twitter.com" in u:
+            t = (s.get("type") or "").lower()
+            u = s.get("url") or ""
+            if twitter is None and (t == "twitter" or "x.com" in u or "twitter.com" in u):
                 twitter = u
-            if t == "telegram":
+            if telegram is None and t == "telegram":
                 telegram = u
 
-        # Age (of the highest-liquidity pair)
-        created_ms = pair.get("pairCreatedAt")
-        age_days = None
-        age_months = None
-        if created_ms and isinstance(created_ms, (int, float)) and created_ms > 0:
-            now_ms = time.time() * 1000
-            age_days = (now_ms - created_ms) / 86400000.0
-            age_months = age_days / 30.44
+    # Age = earliest pool creation time across all pools (closer to the token's real age)
+    created_list = [p.get("pairCreatedAt") for p in ps if isinstance(p.get("pairCreatedAt"), (int, float)) and p.get("pairCreatedAt") > 0]
+    created_ms = min(created_list) if created_list else None
+    age_days = None
+    age_months = None
+    if created_ms:
+        age_days = (time.time() * 1000 - created_ms) / 86400000.0
+        age_months = age_days / 30.44
 
-        # Volume / liquidity / market cap
-        liq_usd = (pair.get("liquidity") or {}).get("usd") or 0.0
-        vol_h24 = (pair.get("volume") or {}).get("h24") or 0.0
-        mcap = pair.get("marketCap") or 0.0
-        fdv = pair.get("fdv") or 0.0
+    # Pool table
+    pools = []
+    for p in ps[:10]:
+        v24 = pair_vol(p, "h24")
+        pools.append({
+            "dex": p.get("dexId"),
+            "quote": (p.get("quoteToken") or {}).get("symbol"),
+            "liquidity_usd": round(pair_liq(p), 2),
+            "volume_24h_usd": round(v24, 2),
+            "share_of_volume": round(v24 / vol_h24, 3) if vol_h24 > 0 else None,
+            "url": p.get("url"),
+        })
 
-        vol_liq_24h = (vol_h24 / liq_usd) if liq_usd > 0 else None
+    dex_count = len({p.get("dexId") for p in ps if p.get("dexId")})
+    top_pool_share = (pair_vol(best, "h24") / vol_h24) if vol_h24 > 0 else None
 
-        # Proxies for 7d and 30d using 24h volume as a rough base
-        vol_7d_proxy = vol_h24 * 7
-        vol_30d_proxy = vol_h24 * 30
-        vol_liq_7d_proxy = (vol_7d_proxy / liq_usd) if liq_usd > 0 else None
-        vol_liq_30d_proxy = (vol_30d_proxy / liq_usd) if liq_usd > 0 else None
+    return {
+        "symbol": tok.get("symbol"),
+        "name": tok.get("name"),
+        "address": tok.get("address") or contract.strip(),
+        "chain": chain_id,
+        "price_usd": None if quote_only else best.get("priceUsd"),
+        "liquidity_usd": liq_total,
+        "volume_24h_usd": vol_h24,
+        "volume_6h_usd": vol_h6,
+        "volume_1h_usd": vol_h1,
+        "market_cap_usd": mcap,
+        "fdv_usd": fdv,
+        "pair_created_ts": created_ms,
+        "website": website,
+        "twitter": twitter,
+        "telegram": telegram,
+        "dex_url": best.get("url"),
+        # Age
+        "age_days": age_days,
+        "age_months": age_months,
+        # Vol/Liq on real DexScreener windows (all pools combined)
+        "vol_liq_1h": safe_div(vol_h1, liq_total),
+        "vol_liq_6h": safe_div(vol_h6, liq_total),
+        "vol_liq_24h": safe_div(vol_h24, liq_total),
+        # FDV ratios
+        "fdv_liq_ratio": safe_div(fdv, liq_total),
+        "mcap_fdv_ratio": safe_div(mcap, fdv),
+        # Vol/Mcap & Liq/Mcap
+        "vol_mcap_24h": safe_div(vol_h24, mcap),
+        "liq_mcap_ratio": safe_div(liq_total, mcap),
+        # Transparency
+        "pool_count": len(ps),
+        "dex_count": dex_count,
+        "top_pool_volume_share": top_pool_share,
+        "top_pool_volume_24h": pair_vol(best, "h24"),
+        "top_pool_liquidity": pair_liq(best),
+        "buys_24h": buys_24,
+        "sells_24h": sells_24,
+        "pairs_returned_by_api": len(pairs),
+        "possibly_capped": len(pairs) >= DEX_PAIR_CAP,
+        "token_is_quote_only": quote_only,
+        "pools": pools,
+    }
 
-        # FDV / liquidity
-        fdv_liq_ratio = (fdv / liq_usd) if liq_usd > 0 else None
-        mcap_fdv_ratio = (mcap / fdv) if fdv > 0 else None
 
-        # Volume / market cap and liquidity / market cap
-        vol_mcap_24h = (vol_h24 / mcap) if mcap > 0 else None
-        liq_mcap_ratio = (liq_usd / mcap) if mcap > 0 else None
+# -------------------------
+# CoinGecko cross-check (includes CEX volume, only for listed tokens)
+# -------------------------
 
+CG_PLATFORMS = {
+    "ethereum": "ethereum",
+    "bsc": "binance-smart-chain",
+    "base": "base",
+    "arbitrum": "arbitrum-one",
+    "polygon": "polygon-pos",
+    "avalanche": "avalanche",
+    "optimism": "optimistic-ethereum",
+    "solana": "solana",
+    "fantom": "fantom",
+    "cronos": "cronos",
+    "linea": "linea",
+    "blast": "blast",
+    "sui": "sui",
+    "ton": "the-open-network",
+    "tron": "tron",
+    "pulsechain": "pulsechain",
+    "sonic": "sonic",
+    "zksync": "zksync",
+}
+
+
+def get_cg_key() -> Optional[str]:
+    key = os.environ.get("COINGECKO_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("COINGECKO_API_KEY")
+    except Exception:
+        return None
+
+
+def fetch_coingecko(chain_id: Optional[str], address: Optional[str]) -> Dict[str, Any]:
+    platform = CG_PLATFORMS.get(chain_id or "")
+    if not platform or not address:
+        return {"status": "unsupported_chain"}
+    addr = address.lower() if address.startswith("0x") else address
+    url = f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{addr}"
+    headers = {"accept": "application/json"}
+    key = get_cg_key()
+    if key:
+        headers["x-cg-demo-api-key"] = key
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code == 404:
+            return {"status": "not_listed"}
+        if r.status_code == 429:
+            return {"status": "rate_limited"}
+        r.raise_for_status()
+        j = r.json()
+        md = j.get("market_data") or {}
         return {
-            "symbol": base.get("symbol"),
-            "name": base.get("name"),
-            "address": base.get("address"),
-            "chain": pair.get("chainId"),
-            "price_usd": pair.get("priceUsd"),
-            "liquidity_usd": liq_usd,
-            "volume_24h_usd": vol_h24,
-            "market_cap_usd": mcap,
-            "fdv_usd": fdv,
-            "pair_created_ts": created_ms,
-            "website": website,
-            "twitter": twitter,
-            "telegram": telegram,
-            "dex_url": pair.get("url"),
-            # Age
-            "age_days": age_days,
-            "age_months": age_months,
-            # Vol/Liq
-            "vol_liq_24h": vol_liq_24h,
-            "vol_liq_7d_proxy": vol_liq_7d_proxy,
-            "vol_liq_30d_proxy": vol_liq_30d_proxy,
-            # FDV ratios
-            "fdv_liq_ratio": fdv_liq_ratio,
-            "mcap_fdv_ratio": mcap_fdv_ratio,
-            # Vol/Mcap & Liq/Mcap
-            "vol_mcap_24h": vol_mcap_24h,
-            "liq_mcap_ratio": liq_mcap_ratio,
+            "status": "ok",
+            "id": j.get("id"),
+            "volume_24h": to_float((md.get("total_volume") or {}).get("usd")),
+            "market_cap": to_float((md.get("market_cap") or {}).get("usd")),
+            "fdv": to_float((md.get("fully_diluted_valuation") or {}).get("usd")),
+            "price": to_float((md.get("current_price") or {}).get("usd")),
         }
     except Exception as e:
-        st.error(f"DexScreener error: {e}")
-        return None
+        return {"status": "error", "detail": str(e)}
 
 
 # -------------------------
@@ -409,13 +594,24 @@ def analyze_token(contract: str, chain: Optional[str] = None) -> Dict[str, Any]:
     if not chain or chain == "auto":
         chain = detect_chain(contract)
 
-    token = fetch_token_from_dexscreener(contract)
+    try:
+        pairs = fetch_pairs(contract)
+    except Exception as e:
+        return {
+            "error": f"DexScreener error: {e}",
+            "contract": contract,
+            "chain_detected": chain,
+        }
+
+    token = aggregate_token(contract, pairs, chain if chain in ("solana", "evm") else None)
     if not token:
         return {
             "error": "Token not found or no liquidity on DexScreener",
             "contract": contract,
             "chain_detected": chain,
         }
+
+    coingecko = fetch_coingecko(token["chain"], token["address"])
 
     website_text = fetch_website_text(token["website"])
     website_items = extract_website_narrative_items(website_text) if website_text else []
@@ -434,6 +630,7 @@ def analyze_token(contract: str, chain: Optional[str] = None) -> Dict[str, Any]:
 
     return {
         "token": token,
+        "coingecko": coingecko,
         "narrative_items": all_items,
         "ons": ons,
         "chain_detected": chain,
@@ -462,31 +659,37 @@ if st.button("Analyze token"):
             st.error(result["error"])
         else:
             token = result["token"]
+            cg = result.get("coingecko") or {}
             items = result["narrative_items"]
             ons = result["ons"]
 
             st.subheader(f"{token['name']} ({token['symbol']})")
+            st.caption(
+                f"Market data is combined across {token['pool_count']} pool(s) on "
+                f"{token['dex_count']} DEX(es) on {token['chain']}."
+            )
+
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 st.metric("Price (USD)", fmt_usd(token["price_usd"], 8))
             with c2:
-                st.metric("Liquidity (USD)", fmt_usd(token["liquidity_usd"]))
+                st.metric("Liquidity (all pools)", fmt_usd(token["liquidity_usd"]))
             with c3:
-                st.metric("24h Volume (USD)", fmt_usd(token["volume_24h_usd"]))
+                st.metric("24h Volume (all pools)", fmt_usd(token["volume_24h_usd"]))
             with c4:
                 st.metric("Market Cap (USD)", fmt_usd(token["market_cap_usd"]))
 
-            # Age & vol/liq
+            # Age & vol/liq on real windows
             c5, c6, c7, c8 = st.columns(4)
             with c5:
                 age_m_str = f"{token['age_months']:.1f} months" if token["age_months"] else "N/A"
-                st.metric("Age", age_m_str)
+                st.metric("Age (oldest pool)", age_m_str)
             with c6:
-                st.metric("Vol/Liq (24h)", fmt_ratio(token["vol_liq_24h"]))
+                st.metric("Vol/Liq (1h)", fmt_ratio(token["vol_liq_1h"]))
             with c7:
-                st.metric("Vol/Liq (7d proxy)", fmt_ratio(token["vol_liq_7d_proxy"]))
+                st.metric("Vol/Liq (6h)", fmt_ratio(token["vol_liq_6h"]))
             with c8:
-                st.metric("Vol/Liq (30d proxy)", fmt_ratio(token["vol_liq_30d_proxy"]))
+                st.metric("Vol/Liq (24h)", fmt_ratio(token["vol_liq_24h"]))
 
             # FDV & ratios
             c9, c10, c11, c12 = st.columns(4)
@@ -497,7 +700,7 @@ if st.button("Analyze token"):
             with c11:
                 st.metric("MCap / FDV", fmt_ratio(token["mcap_fdv_ratio"]))
             with c12:
-                st.metric("6m Avg Vol/Liq", "N/A (needs history)")
+                st.metric("Pools / DEXs", f"{token['pool_count']} / {token['dex_count']}")
 
             # Vol/Mcap & Liq/Mcap
             c13, c14, c15, c16 = st.columns(4)
@@ -506,20 +709,73 @@ if st.button("Analyze token"):
             with c14:
                 st.metric("Liq / MCap", fmt_ratio(token["liq_mcap_ratio"]))
             with c15:
-                # Reserved for future metrics
                 st.metric("Holder Count", "N/A")
             with c16:
                 st.metric("Top 10 Holders %", "N/A")
 
-            st.caption(
-                f"Chain: {token['chain']} | Detected: {result['chain_detected']} | "
-                f"DexScreener: [link]({token['dex_url']})"
-            )
+            # Trade flow
+            c17, c18, c19, c20 = st.columns(4)
+            with c17:
+                st.metric("Buys (24h)", f"{token['buys_24h']:,}")
+            with c18:
+                st.metric("Sells (24h)", f"{token['sells_24h']:,}")
+            with c19:
+                bs = safe_div(token["buys_24h"], token["sells_24h"])
+                st.metric("Buy/Sell ratio", fmt_ratio(bs))
+            with c20:
+                st.metric("Top pool share of volume", fmt_pct(token["top_pool_volume_share"]))
 
             st.caption(
-                "Vol/Liq 7d/30d are rough proxies based on 24h volume. "
-                "True 6m averages and holder metrics require historical/on-chain data."
+                f"Chain: {token['chain']} | Detected: {result['chain_detected']} | "
+                f"Deepest pool on DexScreener: [link]({token['dex_url']})"
             )
+
+            if token["possibly_capped"]:
+                st.warning(
+                    "DexScreener returned its maximum number of pairs for this token, "
+                    "so totals may still be slightly under-counted."
+                )
+            if token["token_is_quote_only"]:
+                st.warning(
+                    "This address only appears as the quote token in the pools found, "
+                    "so price, market cap and FDV are not shown."
+                )
+
+            # CoinGecko cross-check
+            st.subheader("Cross-check: CoinGecko (includes CEX volume)")
+            status = cg.get("status")
+            if status == "ok":
+                g1, g2, g3 = st.columns(3)
+                with g1:
+                    st.metric("CoinGecko 24h Volume", fmt_usd(cg.get("volume_24h")))
+                with g2:
+                    st.metric("CoinGecko Market Cap", fmt_usd(cg.get("market_cap")))
+                with g3:
+                    st.metric("CoinGecko FDV", fmt_usd(cg.get("fdv")))
+                cg_vol = to_float(cg.get("volume_24h"))
+                dex_vol = to_float(token["volume_24h_usd"])
+                if cg_vol and dex_vol is not None and cg_vol > dex_vol * 1.25:
+                    st.info(
+                        "CoinGecko volume is higher than the on-chain DEX total because it also "
+                        "counts trading on centralized exchanges, which DexScreener does not see."
+                    )
+            elif status == "not_listed":
+                st.info("Not listed on CoinGecko (common for new or micro-cap tokens). Only DEX volume is available.")
+            elif status == "rate_limited":
+                st.warning("CoinGecko rate limit hit. Try again in a minute, or set COINGECKO_API_KEY (free demo key).")
+            elif status == "unsupported_chain":
+                st.info("CoinGecko cross-check is not available for this chain.")
+            else:
+                st.warning(f"CoinGecko cross-check failed: {cg.get('detail', 'unknown error')}")
+
+            st.caption(
+                "Volume and liquidity are summed across every DexScreener pool for the token. "
+                "1h/6h/24h are DexScreener's own windows. Historical 7d/30d/6m averages and holder "
+                "metrics need a history or on-chain data source."
+            )
+
+            with st.expander("Pools counted (top 10 by liquidity)"):
+                st.dataframe(token["pools"], use_container_width=True)
 
             st.subheader("Official Narrative Score (ONS)")
             st.write(f"ONS = **{ons:.2f} / 1.00**")
